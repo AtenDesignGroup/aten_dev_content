@@ -1,0 +1,10 @@
+name = Aten Dev Content
+description = Development content
+core = 7.x
+
+dependencies[] = entity
+dependencies[] = taxonomy
+
+files[] = includes/taxonomy.inc
+files[] = includes/entity.inc
+files[] = includes/node.inc
