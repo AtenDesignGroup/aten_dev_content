@@ -1,118 +1,751 @@
 <?php
+
 /**
- * Find content files.
+ * @file
+ * Contains aten_dev_content.module..
  */
-function aten_dev_content_find_files($path) {
-  $items = file_scan_directory($path, '/^.+\.yml$/');
-  return $items;
+
+use Drupal\Core\Routing\RouteMatchInterface;
+use \Drupal\Component\Serialization\Yaml;
+use Drupal\Core\Access\AccessResult;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Entity\Display\EntityViewDisplayInterface;
+
+/**
+ * Implements hook_help().
+ */
+function aten_dev_content_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    // Main module help for the aten_dev_content module.
+    case 'help.page.aten_dev_content':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('A simple way to provide development content for a site.') . '</p>';
+      return $output;
+
+    default:
+  }
 }
 
 /**
- * Parse the file
+ * Implements hook_entity_view().
+ *
+ * Tie into entity_view() to display a notice when people are looking at
+ * development content.
  */
-function aten_dev_content_parse_file($filepath) {
-  if (function_exists('yaml_parse_file')) {
-    return yaml_parse_file($filepath);
+function aten_dev_content_entity_view(array &$build, EntityInterface $entity, EntityViewDisplayInterface $display, $view_mode) {
+  if (aten_dev_content_entity_is_development_content($entity)) {
+    if (!isset($GLOBALS['development_content_message']) || !$GLOBALS['development_content_message']) {
+      drupal_set_message(t('This page contains development content.'));
+    }
+    $GLOBALS['development_content_message'] = TRUE;
   }
 
-  return FALSE;
 }
 
 /**
- * Return the handler.
+ * Implements hook_entity_access().
+ *
+ * Try to limit access to deleting entities that are part of development
+ * content.
  */
-function aten_dev_content_get_handler($data) {
-  $handler = NULL;
-  if (isset($data['vocabulary'])) {
-    module_load_include('inc', 'aten_dev_content', 'includes/taxonomy');
-    $handler = 'DevContentTaxonomyItem';
+function aten_dev_content_entity_access(\Drupal\Core\Entity\EntityInterface $entity, $operation, \Drupal\Core\Session\AccountInterface $account) {
+  if ($operation === 'delete' && aten_dev_content_entity_is_development_content($entity)) {
+    drupal_set_message(t('This entity is development content and should be deleted via the development content module.'), 'error');
+    return AccessResult::forbidden();
   }
-  elseif (isset($data['entity_type']) && $data['entity_type'] === 'node') {
-    module_load_include('inc', 'aten_dev_content', 'includes/node');
-    $handler = 'DevContentNodeItem';
-  }
-  elseif (isset($data['entity_type']) && $data['entity_type'] !== 'node') {
-    module_load_include('inc', 'aten_dev_content', 'includes/entity');
-    $handler = 'DevContentEntityItem';
-  }
-  return $handler;
 }
 
 /**
- * Filter out processed files from the tree.
+ * Implements hook_node_access().
+ *
+ * Try to limit access to deleting nodes that are part of development content.
  */
-function aten_dev_content_filter_processed_files($file) {
-  if (!$file['processed']) {
+function aten_dev_content_node_access(\Drupal\node\NodeInterface $node, $operation, \Drupal\Core\Session\AccountInterface $account) {
+  if ($operation === 'delete' && aten_dev_content_entity_is_development_content($node)) {
+    drupal_set_message(t('This entity is development content and should be deleted via the development content module.'), 'error');
+    return AccessResult::forbidden();
+  }
+}
+
+/**
+ * Implements hook_form_BASE_FORM_ID_alter() for node_delete().
+ *
+ * Display a notice about deleting content.
+ */
+function aten_dev_content_form_node_form_alter(&$form, &$form_state, $form_id) {
+  $node = $form_state->getFormObject()->getEntity();
+  if (aten_dev_content_entity_is_development_content($node)) {
+    drupal_set_message(t('This entity is development content and should not be edited/deleted.'), 'error');
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ *
+ * Disable deleting this content and display a notice.
+ */
+function aten_dev_content_form_node_class_delete_form_alter(&$form, &$form_state, $form_id) {
+  $node = $form_state->getFormObject()->getEntity();
+  if (aten_dev_content_entity_is_development_content($node)) {
+    drupal_set_message(t('This entity is development content and should be deleted via aten_dev_content.'), 'error');
+    $form['#access'] = FALSE;
+  }
+}
+
+/**
+ * Check if the entity is development content.
+ */
+function aten_dev_content_entity_is_development_content(EntityInterface $entity) {
+  $entity_type = $entity->getEntityTypeId();
+  $entity_id = $entity->id();
+
+  $result = \Drupal::database()->select('development_content_map', 'd')->fields('d')
+    ->condition('entity', $entity_type)
+    ->condition('entity_id', $entity_id)
+    ->execute()
+    ->fetchAssoc();
+  if ($result) {
     return TRUE;
   }
+
   return FALSE;
 }
 
 /**
- * Process the content
+ * Disable all development content.
  */
-function aten_dev_content_process($filename, $data) {
-  // figure out handler
-  // TODO refactor this into something sane
-  $handler = aten_dev_content_get_handler($data);
+function aten_dev_content_disable_all() {
+  $handler = Drupal::moduleHandler();
+  $implements = $handler->getImplementations('enable_development_content');
+  foreach ($implements as $module) {
+    aten_dev_content_disable_content($module, $options);
+  }
+}
 
-  if (!$handler) {
-    if (function_exists('drush_log')) {
-      drush_log(t('Could not figure out handler for !filename', array('!filename' => $filename)), 'error');
-    }
-    return FALSE;
+/**
+ * Disable a single module's development content.
+ */
+function aten_dev_content_disable_content($module, array $options = array()) {
+  $options['full_import_tree'] = TRUE;
+  $import_tree = aten_dev_content_get_import_tree($module, $options);
+  if (!$import_tree) {
+    throw new Exception("The module $module does not implement development content");
   }
 
-  foreach ($data['items'] as $item) {
-    $item_handler = new $handler($filename, $item, $data);
+  $options['processing_function'] = 'aten_dev_content_disable_item';
+  $options['module'] = $module;
+  aten_dev_content_prune_tree($import_tree, $module);
+  return aten_dev_content_process_tree($import_tree, $options);
+}
 
-    // check if this already exists
-    $map_exists = $item_handler->mapExists();
-    $item_exists = $item_handler->exists();
-    if ($map_exists && $item_exists) {
-      $item_handler->update();
+/**
+ * Disable a content item.
+ */
+function aten_dev_content_disable_item($item, array $options = array()) {
+  $debug = FALSE;
+  if (isset($options['debug']) && $options['debug']) {
+    $debug = TRUE;
+  }
+
+  // if we are disabling a specific file, only process that item.
+  $item_file = str_replace('.yml', '', $item['file']);
+  if (isset($options['file']) && $item_file != $options['file'] && $item_file != $options['module'] . '.' . $options['file']) {
+    return;
+  }
+
+  $entity = $item['entity'];
+  $bundle = isset($item['bundle']) ? $item['bundle'] : NULL;
+
+  $definition = Drupal::entityTypeManager()->getDefinition($entity);
+  $class = $definition->getClass();
+
+  $db = Drupal::database();
+  foreach ($item['instances'] as $instance) {
+    $this_instance = aten_dev_content_find_entity($class, $item, $instance);
+    if (!$this_instance) {
+      aten_dev_content_debug(__FUNCTION__, 'Could not find instance: ' . $instance['machine_name']);
       continue;
     }
+    $this_instance->delete();
 
-    if ($map_exists && !$item_exists) {
-      drush_log(t('Map exists for !machine_name but content does not exist', array('!machine_name' => $item_handler->machineName())), 'error');
-      continue;
+    $db->delete('development_content_map')
+      ->condition('machine_name', $instance['machine_name'])
+      ->condition('source', $item['file'])
+      ->condition('module', $item['module'])
+      ->execute();
+  }
+
+  // check if there are any remaining items from this file in the development
+  // content map so we can remove those...
+  $query = $db->select('development_content_map', 'd')
+    ->fields('d');
+  $instances = $query->condition('source', $item['file'])
+    ->condition('module', $item['module'])
+    ->execute()->fetchAllAssoc('machine_name');
+  if ($instances) {
+    foreach ($instances as $instance) {
+      $instance = (array) $instance;
+
+      $definition = Drupal::entityTypeManager()->getDefinition($instance['entity']);
+      $class = $definition->getClass();
+
+      $this_entity = aten_dev_content_load_entity($class, $instance['entity_id'], $instance['entity']);
+      if (!$this_entity) {
+        aten_dev_content_debug(__FUNCTION__, 'Could not find instance: ' . $instance['machine_name']);
+        continue;
+      }
+      $this_entity->delete();
+      $db->delete('development_content_map')
+        ->condition('machine_name', $instance['machine_name'])
+        ->condition('source', $instance['file'])
+        ->condition('module', $instance['module'])
+        ->execute();
     }
+  }
 
-    // if the map does not exist and the content does, then we need to add a
-    // locked map item.
-    if (!$map_exists && $item_exists) {
-      $item_handler->addMap($item_exists, TRUE);
-      continue;
+}
+
+/**
+ * Enable all development content.
+ */
+function aten_dev_content_enable_all(array $options = array()) {
+  $handler = Drupal::moduleHandler();
+  $implements = $handler->getImplementations('enable_development_content');
+  foreach ($implements as $module) {
+    aten_dev_content_enable_content($module, $options);
+  }
+}
+
+/**
+ * Enable a single module's development content.
+ */
+function aten_dev_content_enable_content($module, array $options = array()) {
+  $options['full_import_tree'] = TRUE;
+  $import_tree = aten_dev_content_get_import_tree($module, $options);
+  if (!$import_tree) {
+    throw new Exception("The module $module does not implement development content");
+  }
+  $options['module'] = $module;
+  aten_dev_content_prune_tree($import_tree, $module);
+  return aten_dev_content_process_tree($import_tree, $options);
+}
+
+/**
+ * Find an existing entity.
+ */
+function aten_dev_content_find_entity($class, array $item, array $instance) {
+  $result = db_query('SELECT * FROM development_content_map
+    WHERE source IN (:source[]) AND module=:module AND machine_name=:name', [
+      ':source[]' => [
+        $item['file'],
+        str_replace($item['module'] . '.', '', $item['file']),
+      ],
+      ':module' => $item['module'],
+      ':name' => $instance['machine_name'],
+    ])->fetchAll();
+  if (!$result) {
+    return NULL;
+  }
+
+  return aten_dev_content_load_entity($class, $result[0]->entity_id, $item['entity']);
+}
+
+/**
+ * Find an existing entity.
+ */
+function aten_dev_content_find_entity_map($class, array $item, array $instance) {
+  $result = db_query('SELECT * FROM development_content_map
+    WHERE source IN (:source[]) AND module=:module AND machine_name=:name', [
+      ':source[]' => [
+        $item['file'],
+        str_replace($item['module'] . '.', '', $item['file']),
+      ],
+      ':module' => $item['module'],
+      ':name' => $instance['machine_name'],
+    ])->fetchAll();
+  if (!$result) {
+    return NULL;
+  }
+
+  return $result;
+}
+
+/**
+ * Get the full dependency information.
+ */
+function aten_dev_content_get_dependency($dependency, array $item) {
+  $details = explode('.', $dependency);
+  if (count($details) == 1) {
+    array_unshift($details, $item['module']);
+  }
+  return $details;
+}
+
+/**
+ * Get the import tree
+ */
+function aten_dev_content_get_import_tree($module, array $options = array()) {
+  $handler = Drupal::moduleHandler();
+  $found_module = FALSE;
+  $implements = $handler->getImplementations('enable_development_content');
+  $import_tree = [];
+  foreach ($implements as $implementing_module) {
+    if (!$found_module) {
+      $found_module = $module == $implementing_module;
     }
+    if ($module == $implementing_module || (isset($options['full_import_tree']) && $options['full_import_tree'])) {
+      $directories = $handler->invoke($implementing_module, 'enable_development_content');
+      foreach ($directories as $directory) {
+        $content_files = file_scan_directory($directory, '/.+\.yml$/');
+        $items = \Drupal::translation()->formatPlural(count($content_files), 'item', 'items')->__toString();
+        aten_dev_content_debug(__FUNCTION__, 'Found ' . count($content_files) . ' ' . $items . ' for ' . $implementing_module . ' in ' . $directory);
+        foreach ($content_files as $content) {
+          $name = $implementing_module . '.' . $content->name;
+          if (isset($import_tree[$name])) {
+            throw new Exception('The development content name is already defined: ' . check_plain($name));
+          }
+          $import_tree[$name] = Yaml::decode(file_get_contents($content->uri));
+          $import_tree[$name]['module'] = $implementing_module;
+          $import_tree[$name]['name'] = $content->name;
+        }
+      }
+    }
+  }
 
-    // the map does not exist and the item does not exist so create it
-    $item = $item_handler->create();
-    if ($item) {
-      $item_handler->addMap($item);
+  if (!$found_module) {
+    // the requested module was not found, skip importing
+    return [];
+  }
+
+  return $import_tree;
+}
+
+/**
+ * Process the development content tree.
+ */
+function aten_dev_content_process_tree($tree, array $options = array()) {
+  $processed = $non_module_dependencies = $module_items = [];
+  $max = 50;
+  $run = 0;
+
+  $processing_function = isset($options['processing_function']) ? $options['processing_function'] : 'aten_dev_content_process_item';
+
+  // process the import tree, minding their dependencies
+  while ($unprocessed = array_filter($tree, 'aten_dev_content_filter_processed')) {
+    foreach ($unprocessed as $key => $item) {
+      $item['processed'] = FALSE;
+      $item['file'] = $key;
+
+      // if this doesn't have dependencies, we can process it now.
+      if (!isset($item['dependencies'])) {
+        $processed[] = $key;
+        aten_dev_content_debug(__FUNCTION__, "Processing $key");
+        $processing_function($item, $options);
+        $unprocessed[$key]['processed'] = TRUE;
+        aten_dev_content_debug(__FUNCTION__, "Processed $key");
+        continue;
+      }
+
+      // check if all the dependencies have been met
+      $all_dependencies_processed = TRUE;
+      foreach ($item['dependencies'] as $dependency) {
+        $dependency_details = explode('.', $dependency);
+        if (count($dependency_details) == 1) {
+          $dependency = $item['module'] . '.' . $dependency;
+        }
+        else {
+          if ($dependency_details[0] != $options['module']) {
+            $non_module_dependencies[] = $dependency;
+          }
+        }
+        if (!in_array($dependency, $processed)) {
+          $all_dependencies_processed = FALSE;
+          break;
+        }
+      }
+
+      if ($all_dependencies_processed) {
+        $processed[] = $key;
+        aten_dev_content_debug(__FUNCTION__, "Processing $key");
+        $processing_function($item, $options);
+        $unprocessed[$key]['processed'] = TRUE;
+        aten_dev_content_debug(__FUNCTION__, "Processed $key");
+      }
+    }
+    $tree = $unprocessed;
+    $run++;
+    if ($run > $max) {
+      echo "Too many runs. Tree: " . var_export($tree, TRUE);
+      break;
     }
   }
 }
 
 /**
- * Rollback content we added.
+ * Prune items that do not need to be processed from the tree.
+ *
+ * The import tree may contain items that are not in the requested module and
+ * may not be a dependency for one that is... this function cleans that up.
  */
-function aten_dev_content_rollback($path) {
-  $items = db_select('dev_content_map', 'm')
-    ->fields('m')
-    ->execute();
-  $files = array();
-  while ($item = $items->fetchAssoc()) {
-    if (!isset($files[$item['file']])) {
-      $file_path = $path . '/' . $item['file'];
-      $files[$item['file']] = aten_dev_content_parse_file($uri);
-      $handler = aten_dev_content_get_handler($files[$item['file']]);
-      $files[$item['file']]['handler'] = $handler;
-    }
-    else {
-      $handler = $files[$item['file']]['handler'];
+function aten_dev_content_prune_tree(&$tree, $module) {
+  $dependencies = [];
+  $should_process = [];
+  foreach ($tree as $key => $item) {
+    $process_this_item = FALSE;
+
+    // process items in the requested module
+    if ($item['module'] == $module && !in_array($key, $should_process)) {
+      $process_this_item = TRUE;
+      $should_process[] = $key;
     }
 
-    $item_handler = new $handler($item['file'], $item, $data);
+    // add depencies for this item to the list of things to process
+    if ($process_this_item && isset($item['depenencies'])) {
+      foreach ($item['dependencies'] as $dependency) {
+        $details = aten_dev_content_get_dependency($dependency, $item);
+        $dependency = implode('.', $details);
+        if (!in_array($should_process)) {
+          $should_process[] = implode('.', $details);
+        }
+      }
+    }
   }
+
+  $tree_keys = array_keys($tree);
+  $should_not_process = array_diff($should_process, $tree_keys);
+  foreach ($should_not_process as $key) {
+    unset($tree[$key]);
+  }
+}
+
+/**
+ * Process the tree item.
+ */
+function aten_dev_content_process_item($item, array $options = array()) {
+  $debug = FALSE;
+  if (isset($options['debug']) && $options['debug']) {
+    $debug = TRUE;
+  }
+
+  // Figure out the entity/bundle
+  $entity = $item['entity'];
+  $bundle = isset($item['bundle']) ? $item['bundle'] : NULL;
+
+  // grab some information about this entity
+  $definition = Drupal::entityTypeManager()->getDefinition($entity);
+  $class = $definition->getClass();
+
+  if (!isset($item['plugins'])) {
+    $item['plugins'] = [];
+  }
+
+  // autoload some plugins depending on the entity type.
+  if ($entity === 'taxonomy_term') {
+    $item['plugins']['vocabulary'] = 'Drupal\aten_dev_content\Plugins\TaxonomyVocabularyRowPlugin';
+  }
+
+  if (!isset($item['plugins']['field_value'])) {
+    $item['plugins']['field_value'] = 'Drupal\aten_dev_content\Plugins\FieldValuePlugin';
+  }
+
+  // get the row and value plugins
+  $value_plugins = $row_plugins = [];
+  if (isset($item['plugins'])) {
+    array_map(function($plugin) use (&$value_plugins, &$row_plugins, $debug) {
+      $this_plugin = new $plugin();
+      $this_plugin->debug = $debug;
+      if ($this_plugin->processesValues() && !in_array($plugin, $value_plugins)) {
+        $value_plugins[] = $this_plugin;
+      }
+      elseif ($this_plugin->processesRows() && !in_array($plugin, $row_plugins)) {
+        $row_plugins[] = $this_plugin;
+      }
+    }, $item['plugins']);
+  }
+
+  if ($debug) {
+    aten_dev_content_debug(__FUNCTION__, 'item: ' . var_export($item, TRUE));
+  }
+
+  // now try to make/update the instances.
+  $exceptions = [];
+  $entities = [];
+  foreach ($item['instances'] as $instance) {
+    try {
+      $this_instance = [];
+      if ($bundle) {
+        $this_instance['type'] = $bundle;
+      }
+
+      // process values
+      foreach ($instance as $key => $value) {
+        if ($key === 'machine_name') {
+          continue;
+        }
+
+        // assert that the value is an array (so we can support arrays!)
+        $original_was_an_array = is_array($value);
+        if (!is_array($value)) {
+          $value = [$value];
+        }
+
+        // apply value plugins
+        $values = [];
+        foreach ($value as $this_value) {
+          // this value is a new entity unto itself (presumably part of an
+          // entity reference field, so we really just want the target), add it
+          // and change the value to a reference to this entity.
+          if (isset($this_value['machine_name'])) {
+            aten_dev_content_debug(__FUNCTION__, 'Creating sub item: ' . $this_value['machine_name']);
+            $copy = ['entity', 'vocabulary', 'bundle'];
+            $new_item = ['file' => $item['file'], 'module' => $item['module']];
+            foreach ($copy as $copy_item) {
+              if (isset($this_value[$copy_item])) {
+                $new_item[$copy_item] = $this_value[$copy_item];
+                unset($this_value[$copy_item]);
+              }
+            }
+            $new_item['instances'] = [];
+            $new_item['instances'][] = $this_value;
+            $this_entity = aten_dev_content_process_item($new_item, $options);
+            $this_entity = array_shift($this_entity);
+            if (!$this_entity) {
+              aten_dev_content_debug(__FUNCTION__, 'Could not create sub item: ' . $this_value['machine_name']);
+              throw new Exception('Could not create sub item: ' . json_encode($this_value));
+            }
+            $this_value = $this_entity->id();
+          }
+
+          $processed = FALSE;
+          foreach ($value_plugins as $plugin) {
+            if ($plugin->canProcessValue($key, $this_value, $item, $instance)) {
+              if ($debug) {
+                aten_dev_content_debug(__FUNCTION__, 'Calling value plugin ' . get_class($plugin) . ' on ' . $key);
+              }
+              $this_value = $plugin->processValue($key, $this_value, $item, $instance);
+              $values[] = $this_value;
+              $processed = TRUE;
+            }
+          }
+
+          if (!$processed) {
+            $values[] = $this_value;
+          }
+        }
+
+        if ($debug) {
+          aten_dev_content_debug(__FUNCTION__, 'Values : ' . json_encode($values) . ' for ' . $key);
+        }
+
+        if ($original_was_an_array) {
+          $this_instance[$key] = $values;
+        }
+        else {
+          $this_instance[$key] = $values[0];
+        }
+      }
+
+      // apply row plugins
+      foreach ($row_plugins as $plugin) {
+        if ($plugin->canProcessRow($this_instance, $item, $instance)) {
+          if ($debug) {
+            aten_dev_content_debug(__FUNCTION__, 'Calling row plugin ' . get_class($plugin) . ' on ' . $key);
+          }
+          $this_instance = $plugin->processRow($this_instance, $item, $instance);
+        }
+      }
+
+      if ($debug) {
+        aten_dev_content_debug(__FUNCTION__, 'Final item: ' . var_export($this_instance, TRUE));
+        aten_dev_content_debug(__FUNCTION__, 'Class: ' . $class);
+      }
+      $entities[] = aten_dev_content_create_or_find_entity($class, $this_instance, $item, $instance, $options);
+    }
+    catch (Drupal\aten_dev_content\Plugins\PluginException $e) {
+      $exceptions[] = $e;
+    }
+  }
+  foreach ($exceptions as $exception) {
+    aten_dev_content_debug(__FUNCTION__, 'Exception: ' . $exception->getMessage());
+  }
+  return $entities;
+}
+
+/**
+ * Create the entity if needed or find it.
+ */
+function aten_dev_content_create_or_find_entity($class, array $this_instance, array $item, array $instance, array $options) {
+  $debug = FALSE;
+  if (isset($options['debug']) && $options['debug']) {
+    $debug = TRUE;
+  }
+  $db = \Drupal::database();
+
+  // check the dev content map to see if this exists
+  $entity = aten_dev_content_find_entity($class, $item, $instance);
+  $result = aten_dev_content_find_entity_map($class, $item, $instance);
+
+  // if the item does not exist, go ahead and save this one...
+  if (!$entity) {
+    aten_dev_content_debug(__FUNCTION__, 'Entity did not exist already, creating it');
+    try {
+      $entity = aten_dev_content_create_entity($class, $this_instance, $item);
+    }
+    catch (Drupal\Core\Entity\Exception\AmbiguousEntityClassException $e) {
+      Drupal::logger()->error('Could not save item: ' . $e->getMessage() . ': ' . $e->getLine());
+      aten_dev_content_debug(__FUNCTION__, 'Could not save item: ' . $e->getMessage() . ': ' . var_export($this_instance, TRUE) . "\n" . var_export($item));
+      return;
+    }
+    $entity->save();
+    $map = [
+      'machine_name' => $instance['machine_name'],
+      'entity' => $item['entity'],
+      'entity_id' => $entity->id(),
+      'bundle' => isset($item['bundle']) ? $item['bundle'] : '',
+      'source' => $item['file'],
+      'module' => $item['module'],
+      'hash' => sha1(json_encode($instance)),
+    ];
+
+    aten_dev_content_debug(__FUNCTION__, 'inserting instance');
+    $db->insert('development_content_map')->fields($map)->execute();
+    return $entity;
+  }
+
+  // check if the entity still exists
+  if (!$entity) {
+    aten_dev_content_debug(__FUNCTION__, 'found missing entity: ' . var_export($result[0], TRUE));
+
+    // remove old entity map
+    $db->delete('development_content_map')
+      ->condition('machine_name', $result[0]->machine_name)
+      ->condition('source', $result[0]->source)
+      ->execute();
+
+    // add the entity
+    $entity = aten_dev_content_create_entity($class, $this_instance, $item);
+    $entity->save();
+    $map = [
+      'machine_name' => $instance['machine_name'],
+      'entity' => $item['entity'],
+      'entity_id' => $entity->id(),
+      'bundle' => isset($item['bundle']) ? $item['bundle'] : '',
+      'source' => $item['file'],
+      'module' => $item['module'],
+      'hash' => sha1(json_encode($instance)),
+    ];
+
+    aten_dev_content_debug(__FUNCTION__, 'inserting instance');
+    $db->insert('development_content_map')->fields($map)->execute();
+    return $entity;
+  }
+
+  // if the item exists in the map, we should try to see if it has changed
+  // and update it.
+  aten_dev_content_debug(__FUNCTION__, 'Entity exists, updating it');
+  $map = [
+    'machine_name' => $instance['machine_name'],
+    'entity' => $item['entity'],
+    'entity_id' => $entity->id(),
+    'bundle' => isset($item['bundle']) ? $item['bundle'] : '',
+    'source' => $item['file'],
+    'module' => $item['module'],
+  ];
+  $hash = sha1(json_encode($instance));
+  if ($hash != $result[0]->hash || (isset($options['force']) && $options['force'])) {
+    if (!$entity) {
+      aten_dev_content_debug(__FUNCTION__, sprintf('could not load entity: %s %s [%s]', $map['entity'], $map['bundle'], $item['file']));
+    }
+    else {
+      foreach ($this_instance as $key => $value) {
+        $entity->set($key, $value);
+      }
+      $entity->save();
+    }
+
+    // update the map entry.
+    $db->update('development_content_map')
+      ->fields(['hash' => $hash])
+      ->condition('machine_name', $map['machine_name'])
+      ->condition('source', $map['source'])
+      ->condition('module', $map['module'])
+      ->execute();
+  }
+
+  aten_dev_content_debug(__FUNCTION__, 'instance up-to-date');
+  return $entity;
+}
+
+/**
+ * Create an entity.
+ */
+function aten_dev_content_create_entity($class, $this_instance, $item) {
+  if (!preg_match('/EckEntity/', $class)) {
+    return $class::create($this_instance);
+  }
+  return entity_create($item['entity'], $this_instance);
+}
+
+/**
+ * Load an entity.
+ */
+function aten_dev_content_load_entity($class, $entity_id, $entity_type) {
+  if (!preg_match('/EckEntity/', $class)) {
+    return $class::load($entity_id);
+  }
+
+  return entity_load($entity_type, $entity_id);
+}
+
+/**
+ * Get the entity from the map.
+ */
+function aten_dev_content_get_development_content(array $options) {
+  $db = \Drupal::database();
+  $query = $db
+    ->select('development_content_map', 'm')
+    ->fields('m');
+  $module = NULL;
+  if (isset($options['module'])) {
+    $module = $options['module'];
+  }
+  foreach ($options as $key => $value) {
+    $operation = NULL;
+    if ($key == 'source' && $module) {
+      $value = [$value, "$module.$value"];
+      $operation = 'IN';
+    }
+
+    if (!$operation) {
+      $query->condition($key, $value);
+    }
+    else {
+      $query->condition($key, $value, $operation);
+    }
+  }
+  return $query->execute()->fetchAssoc();
+}
+
+/**
+ * Filter processed items.
+ */
+function aten_dev_content_filter_processed($item) {
+  if (!isset($item['processed']) || (isset($item['processed']) && !$item['processed'])) {
+    return TRUE;
+  }
+}
+
+/**
+ * Debug a message.
+ */
+function aten_dev_content_debug($function, $message, $status = 'ok') {
+  if (function_exists('drush_log')) {
+    return drush_log($function . ': ' . $message, $status);
+  }
+  elseif (function_exists('dpm') && php_sapi_name() != 'cli') {
+    return dpm($message, $function);
+  }
+
+  fwrite('php://stderr', $function . ': ' . $message);
 }
